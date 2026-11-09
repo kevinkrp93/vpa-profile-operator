@@ -18,9 +18,10 @@ package controller
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"hash/fnv"
 	"strings"
 
 	"github.com/kevinkrp93/vpa-profile-operator/api"
@@ -83,7 +84,9 @@ func (r *Reconciler) Reconcile(ctx context.Context, key string) error {
 	}
 	vpaName := VPAName(kind, name)
 	if !exists {
-		return r.deleteOwnedVPA(ctx, namespace, vpaName, kind, name, "")
+		klog.InfoS("Workload is absent from informer cache; leaving VPA cleanup to Kubernetes owner-reference garbage collection",
+			"kind", kind, "namespace", namespace, "name", name)
+		return nil
 	}
 
 	profileName := workload.GetAnnotations()[api.ProfileAnnotation]
@@ -168,14 +171,14 @@ func VPAName(kind, workloadName string) string {
 	if len(candidate) <= 253 && len(lastLabel) <= 63 {
 		return candidate
 	}
-	hash := fnv.New32a()
-	_, _ = hash.Write([]byte(candidate))
+	digest := sha256.Sum256([]byte(candidate))
 	firstLabel := strings.SplitN(workloadName, ".", 2)[0]
-	prefixLength := 63 - len(suffix) - 9
+	hashSuffix := "-" + hex.EncodeToString(digest[:8])
+	prefixLength := 63 - len(suffix) - len(hashSuffix)
 	if len(firstLabel) > prefixLength {
 		firstLabel = firstLabel[:prefixLength]
 	}
-	return strings.TrimRight(firstLabel, "-") + fmt.Sprintf("-%08x%s", hash.Sum32(), suffix)
+	return strings.TrimRight(firstLabel, "-") + hashSuffix + suffix
 }
 
 func DesiredVPA(namespace, vpaName, targetKind, targetName string, uid types.UID, profile api.ResolvedProfile) (*unstructured.Unstructured, error) {
@@ -189,7 +192,7 @@ func DesiredVPA(namespace, vpaName, targetKind, targetName string, uid types.UID
 	if profile.CPUHistogramDecayHalfLife > 0 {
 		policy["cpuHistogramDecayHalfLife"] = profile.CPUHistogramDecayHalfLife.String()
 	}
-	updatePolicy := map[string]any{"updateMode": "Auto"}
+	updatePolicy := map[string]any{"updateMode": "Recreate"}
 	if profile.PodUpdateThreshold != nil {
 		updatePolicy["podUpdateThreshold"] = *profile.PodUpdateThreshold
 	}
@@ -202,7 +205,7 @@ func DesiredVPA(namespace, vpaName, targetKind, targetName string, uid types.UID
 			"labels": map[string]any{
 				api.ManagedByLabel: api.ManagedByValue,
 				kindLabel:          targetKind,
-				nameLabel:          targetName,
+				nameLabel:          workloadNameLabel(targetName),
 			},
 			"ownerReferences": []any{map[string]any{
 				"apiVersion": "apps/v1",
@@ -272,17 +275,25 @@ func (r *Reconciler) deleteOwnedVPA(ctx context.Context, namespace, name, kind, 
 }
 
 func isOwnedBy(vpa *unstructured.Unstructured, kind, name, uid string) bool {
+	if uid == "" {
+		return false
+	}
 	if vpa.GetLabels()[api.ManagedByLabel] != api.ManagedByValue ||
-		vpa.GetLabels()[kindLabel] != kind || vpa.GetLabels()[nameLabel] != name {
+		vpa.GetLabels()[kindLabel] != kind || vpa.GetLabels()[nameLabel] != workloadNameLabel(name) {
 		return false
 	}
 	for _, owner := range vpa.GetOwnerReferences() {
 		if owner.APIVersion == "apps/v1" && owner.Kind == kind && owner.Name == name &&
-			(owner.UID != "" && (uid == "" || string(owner.UID) == uid)) {
+			owner.UID != "" && string(owner.UID) == uid {
 			return true
 		}
 	}
 	return false
+}
+
+func workloadNameLabel(name string) string {
+	digest := sha256.Sum256([]byte(name))
+	return "name-" + hex.EncodeToString(digest[:8])
 }
 
 func LogReconcileError(key string, err error) {

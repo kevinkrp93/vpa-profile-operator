@@ -69,17 +69,30 @@ metadata:
 
 `examples/workload.yaml` is a complete sample Deployment. The generated VPA
 uses the `*` container policy with the selected CPU histogram half-life, an
-`Auto` update policy with the selected pod update threshold, and a target
+`Recreate` update policy with the selected pod update threshold, and a target
 reference to the workload. Co-named Deployments and StatefulSets use distinct
 VPA names (`<workload>-deployment` and `<workload>-statefulset`); long names
 are shortened deterministically.
 
 Changes to the selected annotation or central ConfigMap are reconciled
 eventually. Removing the annotation deletes that workload's VPA only when the
-operator's manager label, workload kind/name labels, and workload UID owner
-reference all match. Existing unmanaged VPAs are never overwritten or deleted.
-Ownership conflicts, invalid/missing profiles, and API errors are logged and
-retried with rate limiting. Identical desired VPAs are not updated.
+operator's manager label, workload kind/name identifier labels, and exact
+workload UID owner reference all match. The full workload name is checked in
+the owner reference; the label uses a bounded hash identifier. If the workload
+is absent from the informer cache, the operator does not infer its UID or
+delete a VPA; Kubernetes owner-reference garbage collection cleans up VPAs
+when their workload is actually deleted. Existing unmanaged VPAs are never
+overwritten or deleted. Ownership conflicts, invalid/missing profiles, and API
+errors are logged and retried with rate limiting. Identical desired VPAs are
+not updated.
+
+Updating a profile changes the VPA policy but does not reset or reweight CPU
+histogram samples already accumulated by the recommender. Their previously
+accumulated weights remain unchanged.
+
+The corresponding VPA implementation is available at
+[kevinkrp93/autoscaler, branch `vpa-profile-poc`](https://github.com/kevinkrp93/autoscaler/tree/vpa-profile-poc),
+commit [`4e95bec`](https://github.com/kevinkrp93/autoscaler/commit/4e95bec).
 
 ## Development
 

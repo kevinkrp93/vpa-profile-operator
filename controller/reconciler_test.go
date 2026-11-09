@@ -12,6 +12,7 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/validation"
 	dynamicfake "k8s.io/client-go/dynamic/fake"
 	"k8s.io/client-go/tools/cache"
 )
@@ -163,6 +164,64 @@ func TestReconcileReportsMissingProfiles(t *testing.T) {
 	}
 }
 
+func TestMissingWorkloadFromStaleCacheDoesNotDeleteReplacementVPAs(t *testing.T) {
+	ctx := context.Background()
+	client := dynamicfake.NewSimpleDynamicClient(runtime.NewScheme())
+	replacement := testDeployment("checkout", "replacement-uid", "baseline")
+	vpa, err := DesiredVPA("apps", VPAName(DeploymentKind, "checkout"), DeploymentKind, "checkout", replacement.UID, api.ResolvedProfile{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.Resource(vpaGVR).Namespace("apps").Create(ctx, vpa, metav1.CreateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+
+	// The informer cache can briefly miss an object while a same-name
+	// replacement's owned VPA already exists. Absence provides no UID proof.
+	reconciler := testReconciler(client, cache.NewStore(cache.MetaNamespaceKeyFunc), cache.NewStore(cache.MetaNamespaceKeyFunc), cache.NewStore(cache.MetaNamespaceKeyFunc))
+	if err := reconciler.Reconcile(ctx, WorkloadKey(DeploymentKind, "apps", "checkout")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.Resource(vpaGVR).Namespace("apps").Get(ctx, VPAName(DeploymentKind, "checkout"), metav1.GetOptions{}); err != nil {
+		t.Fatalf("VPA owned by replacement workload was deleted during cache gap: %v", err)
+	}
+}
+
+func TestDesiredVPALabelsAreValidForMaximumLengthWorkloadName(t *testing.T) {
+	workloadName := strings.Join([]string{
+		strings.Repeat("a", 63),
+		strings.Repeat("b", 63),
+		strings.Repeat("c", 63),
+		strings.Repeat("d", 61),
+	}, ".")
+	if problems := validation.IsDNS1123Subdomain(workloadName); len(problems) != 0 {
+		t.Fatalf("test workload name must be Kubernetes-valid: %v", problems)
+	}
+	vpaName := VPAName(DeploymentKind, workloadName)
+	vpa, err := DesiredVPA("apps", vpaName, DeploymentKind, workloadName, types.UID("workload-uid"), api.ResolvedProfile{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if problems := validation.IsDNS1123Subdomain(vpa.GetName()); len(problems) != 0 {
+		t.Fatalf("generated VPA name is invalid: %v", problems)
+	}
+	for label, value := range vpa.GetLabels() {
+		if problems := validation.IsQualifiedName(label); len(problems) != 0 {
+			t.Errorf("invalid VPA label key %q: %v", label, problems)
+		}
+		if problems := validation.IsValidLabelValue(value); len(problems) != 0 {
+			t.Errorf("invalid VPA label value %q=%q: %v", label, value, problems)
+		}
+	}
+	if vpa.GetLabels()[nameLabel] == workloadName || len(vpa.GetLabels()[nameLabel]) > 63 {
+		t.Fatalf("expected a bounded identifier instead of the full workload name: %q", vpa.GetLabels()[nameLabel])
+	}
+	owners := vpa.GetOwnerReferences()
+	if len(owners) != 1 || owners[0].Name != workloadName {
+		t.Fatalf("full workload name must be verified by owner reference: %+v", owners)
+	}
+}
+
 func TestReconcileSwitchesProfilesAndRejectsInvalidProfile(t *testing.T) {
 	ctx := context.Background()
 	client := dynamicfake.NewSimpleDynamicClient(runtime.NewScheme())
@@ -274,6 +333,10 @@ func testConfigMap(profiles string) *corev1.ConfigMap {
 
 func assertVPAValues(t *testing.T, vpa *unstructured.Unstructured, kind, target, halfLife string, threshold float64) {
 	t.Helper()
+	updateMode, found, err := unstructured.NestedString(vpa.Object, "spec", "updatePolicy", "updateMode")
+	if err != nil || !found || updateMode != "Recreate" {
+		t.Fatalf("unexpected VPA update mode: %q found=%v err=%v", updateMode, found, err)
+	}
 	targetRef, found, err := unstructured.NestedMap(vpa.Object, "spec", "targetRef")
 	if err != nil || !found || targetRef["kind"] != kind || targetRef["name"] != target {
 		t.Fatalf("unexpected targetRef: %v, found=%v err=%v", targetRef, found, err)
