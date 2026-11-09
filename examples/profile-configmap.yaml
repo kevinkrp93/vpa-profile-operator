@@ -1,0 +1,14 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: vpa-profiles
+  namespace: vpa-system
+data:
+  profiles.yaml: |
+    profiles:
+      conservative:
+        cpuHistogramDecayHalfLife: 24h
+        podUpdateThreshold: 0.2
+      aggressive:
+        cpuHistogramDecayHalfLife: 4h
+        podUpdateThreshold: 0.05

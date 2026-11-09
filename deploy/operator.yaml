@@ -1,0 +1,82 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: vpa-system
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: vpa-profile-operator
+  namespace: vpa-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: vpa-profile-operator
+rules:
+  - apiGroups: ["apps"]
+    resources: ["deployments", "statefulsets"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["autoscaling.k8s.io"]
+    resources: ["verticalpodautoscalers"]
+    verbs: ["get", "create", "update", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: vpa-profile-operator
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: vpa-profile-operator
+subjects:
+  - kind: ServiceAccount
+    name: vpa-profile-operator
+    namespace: vpa-system
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vpa-profile-operator
+  namespace: vpa-system
+  labels:
+    app.kubernetes.io/name: vpa-profile-operator
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: vpa-profile-operator
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: vpa-profile-operator
+    spec:
+      serviceAccountName: vpa-profile-operator
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: operator
+          image: ghcr.io/kevinkrp93/vpa-profile-operator:latest
+          imagePullPolicy: IfNotPresent
+          args:
+            - --profile-configmap-namespace=vpa-system
+            - --profile-configmap-name=vpa-profiles
+            - --profile-configmap-key=profiles.yaml
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: 25m
+              memory: 32Mi
+            limits:
+              cpu: 200m
+              memory: 128Mi
