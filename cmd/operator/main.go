@@ -307,7 +307,8 @@ func mapsEqual[K comparable, V comparable](a, b map[K]V) bool {
 		return false
 	}
 	for key, value := range a {
-		if b[key] != value {
+		other, exists := b[key]
+		if !exists || other != value {
 			return false
 		}
 	}

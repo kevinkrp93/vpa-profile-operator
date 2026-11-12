@@ -119,5 +119,16 @@ commit [`4e95bec`](https://github.com/kevinkrp93/autoscaler/commit/4e95bec).
 ```sh
 gofmt -w api controller cmd
 go test ./...
+go test -race -count=1 ./...
 go build ./cmd/operator
 ```
+
+The unit tests cover both supported workload kinds through opt-in, profile
+switching, spec-drift repair, VPA recreation, and annotation removal. They
+also cover central-profile updates, namespace/kind isolation, invalid
+configuration and recovery, ownership protection, stale-cache write retries,
+cache-only reads, event filtering, ConfigMap watch scope, and manifest RBAC.
+
+Tests use fake Kubernetes clients and local informer stores; no container or
+cluster is required. They do not replace live-cluster validation of API-server
+admission, authorization, garbage collection, or actual VPA recommendations.
