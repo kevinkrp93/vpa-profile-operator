@@ -81,10 +81,30 @@ workload UID owner reference all match. The full workload name is checked in
 the owner reference; the label uses a bounded hash identifier. If the workload
 is absent from the informer cache, the operator does not infer its UID or
 delete a VPA; Kubernetes owner-reference garbage collection cleans up VPAs
-when their workload is actually deleted. Existing unmanaged VPAs are never
+when their workload is actually deleted. Deletes are guarded with the VPA's
+UID and resource version so a VPA replaced after the ownership check is not
+deleted accidentally. The operator also watches managed VPA objects and
+reconciles deletion or spec drift. Existing unmanaged VPAs are never
 overwritten or deleted. Ownership conflicts, invalid/missing profiles, and API
 errors are logged and retried with rate limiting. Identical desired VPAs are
 not updated.
+
+Reconciliation reads workloads, profiles, and VPAs from local informer caches;
+it does not issue API GETs or LISTs. One shared informer per resource maintains
+the caches through watches, with no periodic resync. The ConfigMap informer
+is restricted to the configured namespace and name. Status-only VPA and
+workload updates do not enqueue reconciliation. Initial cache population and
+watch recovery can still require API snapshots or relists.
+
+Only necessary creates, updates, and deletes are sent during reconciliation.
+Updates use the cached resource version and a deep copy of the object;
+deletes use the cached UID and resource version as preconditions. Conflicts,
+missing objects during updates, and create `AlreadyExists` responses are
+retried through the rate-limited queue using the cache, with ownership checked
+again on each attempt. A stale cache never causes an unconditional overwrite
+or delete. The Kubernetes and dynamic clients share a token-bucket limiter
+of 5 requests/second with a burst of 10 across API requests; watch events do
+not consume individual request tokens. This limit is per operator process.
 
 Updating a profile changes the VPA policy but does not reset or reweight CPU
 histogram samples already accumulated by the recommender. Their previously

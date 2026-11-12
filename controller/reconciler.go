@@ -20,13 +20,13 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
-	"encoding/json"
 	"fmt"
 	"strings"
 
 	"github.com/kevinkrp93/vpa-profile-operator/api"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -48,6 +48,30 @@ var vpaGVR = schema.GroupVersionResource{
 	Group: "autoscaling.k8s.io", Version: "v1", Resource: "verticalpodautoscalers",
 }
 
+func VPAResource() schema.GroupVersionResource {
+	return vpaGVR
+}
+
+func VPAKindLabel() string {
+	return kindLabel
+}
+
+func VPANameLabel() string {
+	return nameLabel
+}
+
+func IsManagedVPA(vpa *unstructured.Unstructured, kind, name string) bool {
+	if vpa.GetLabels()[api.ManagedByLabel] != api.ManagedByValue ||
+		vpa.GetLabels()[kindLabel] != kind || vpa.GetLabels()[nameLabel] != workloadNameLabel(name) {
+		return false
+	}
+	return true
+}
+
+func WorkloadNameLabel(name string) string {
+	return workloadNameLabel(name)
+}
+
 type Reconciler struct {
 	DynamicClient dynamic.Interface
 	ProfileNS     string
@@ -56,6 +80,7 @@ type Reconciler struct {
 	Deployments   cache.Store
 	StatefulSets  cache.Store
 	ConfigMaps    cache.Store
+	VPAs          cache.Store
 }
 
 // WorkloadKey makes workloads with the same namespace/name but different kinds
@@ -232,42 +257,64 @@ func DesiredVPA(namespace, vpaName, targetKind, targetName string, uid types.UID
 
 func (r *Reconciler) applyVPA(ctx context.Context, namespace, name string, desired *unstructured.Unstructured, kind, targetName, uid string) error {
 	resource := r.DynamicClient.Resource(vpaGVR).Namespace(namespace)
-	current, err := resource.Get(ctx, name, metav1.GetOptions{})
-	if apierrors.IsNotFound(err) {
-		_, err = resource.Create(ctx, desired, metav1.CreateOptions{})
+	current, exists, err := r.getVPA(namespace, name)
+	if err != nil {
 		return err
 	}
-	if err != nil {
+	if !exists {
+		_, err = resource.Create(ctx, desired, metav1.CreateOptions{})
 		return err
 	}
 	if !isOwnedBy(current, kind, targetName, uid) {
 		return fmt.Errorf("VPA %s/%s exists but is not owned by %s %s/%s UID %q", namespace, name, kind, namespace, targetName, uid)
 	}
-	currentSpec, _, _ := unstructured.NestedFieldNoCopy(current.Object, "spec")
-	desiredSpec, _, _ := unstructured.NestedFieldNoCopy(desired.Object, "spec")
-	currentSpecJSON, _ := json.Marshal(currentSpec)
-	desiredSpecJSON, _ := json.Marshal(desiredSpec)
-	if string(currentSpecJSON) == string(desiredSpecJSON) {
+	if apiequality.Semantic.DeepEqual(current.Object["spec"], desired.Object["spec"]) {
 		return nil
 	}
-	current.Object["spec"] = desired.Object["spec"]
-	_, err = resource.Update(ctx, current, metav1.UpdateOptions{})
+	if current.GetUID() == "" || current.GetResourceVersion() == "" {
+		return fmt.Errorf("cannot safely update VPA %s/%s without UID and resourceVersion", namespace, name)
+	}
+	updated := current.DeepCopy()
+	updated.Object["spec"] = desired.Object["spec"]
+	_, err = resource.Update(ctx, updated, metav1.UpdateOptions{})
 	return err
+}
+
+func (r *Reconciler) getVPA(namespace, name string) (*unstructured.Unstructured, bool, error) {
+	if r.VPAs == nil {
+		return nil, false, fmt.Errorf("VPA informer store is not configured")
+	}
+	item, exists, err := r.VPAs.GetByKey(namespace + "/" + name)
+	if err != nil || !exists {
+		return nil, exists, err
+	}
+	vpa, ok := item.(*unstructured.Unstructured)
+	if !ok {
+		return nil, false, fmt.Errorf("unexpected VPA cache object %T", item)
+	}
+	return vpa, true, nil
 }
 
 func (r *Reconciler) deleteOwnedVPA(ctx context.Context, namespace, name, kind, targetName, uid string) error {
 	resource := r.DynamicClient.Resource(vpaGVR).Namespace(namespace)
-	current, err := resource.Get(ctx, name, metav1.GetOptions{})
-	if apierrors.IsNotFound(err) {
-		return nil
-	}
-	if err != nil {
+	current, exists, err := r.getVPA(namespace, name)
+	if err != nil || !exists {
 		return err
 	}
 	if !isOwnedBy(current, kind, targetName, uid) {
 		return nil
 	}
-	err = resource.Delete(ctx, name, metav1.DeleteOptions{})
+	vpaUID := current.GetUID()
+	resourceVersion := current.GetResourceVersion()
+	if vpaUID == "" || resourceVersion == "" {
+		return fmt.Errorf("cannot safely delete VPA %s/%s without UID and resourceVersion", namespace, name)
+	}
+	err = resource.Delete(ctx, name, metav1.DeleteOptions{
+		Preconditions: &metav1.Preconditions{
+			UID:             &vpaUID,
+			ResourceVersion: &resourceVersion,
+		},
+	})
 	if apierrors.IsNotFound(err) {
 		return nil
 	}
@@ -278,8 +325,7 @@ func isOwnedBy(vpa *unstructured.Unstructured, kind, name, uid string) bool {
 	if uid == "" {
 		return false
 	}
-	if vpa.GetLabels()[api.ManagedByLabel] != api.ManagedByValue ||
-		vpa.GetLabels()[kindLabel] != kind || vpa.GetLabels()[nameLabel] != workloadNameLabel(name) {
+	if !IsManagedVPA(vpa, kind, name) {
 		return false
 	}
 	for _, owner := range vpa.GetOwnerReferences() {

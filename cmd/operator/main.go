@@ -31,13 +31,19 @@ import (
 	"github.com/kevinkrp93/vpa-profile-operator/api"
 	"github.com/kevinkrp93/vpa-profile-operator/controller"
 	corev1 "k8s.io/api/core/v1"
+	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/client-go/dynamic"
+	dynamicinformer "k8s.io/client-go/dynamic/dynamicinformer"
 	"k8s.io/client-go/informers"
+	coreinformers "k8s.io/client-go/informers/core/v1"
 	kubeclient "k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/tools/clientcmd"
+	"k8s.io/client-go/util/flowcontrol"
 	"k8s.io/client-go/util/workqueue"
 	"k8s.io/klog/v2"
 )
@@ -67,6 +73,7 @@ func run(ctx context.Context) error {
 			return fmt.Errorf("load Kubernetes configuration: %w", err)
 		}
 	}
+	config.RateLimiter = flowcontrol.NewTokenBucketRateLimiter(rest.DefaultQPS, rest.DefaultBurst)
 	kube, err := kubeclient.NewForConfig(config)
 	if err != nil {
 		return fmt.Errorf("create Kubernetes client: %w", err)
@@ -79,7 +86,9 @@ func run(ctx context.Context) error {
 	factory := informers.NewSharedInformerFactory(kube, 0)
 	deployments := factory.Apps().V1().Deployments().Informer()
 	statefulSets := factory.Apps().V1().StatefulSets().Informer()
-	configMaps := factory.Core().V1().ConfigMaps().Informer()
+	configMaps := newProfileConfigMapInformer(kube, *profileNamespace, *profileName)
+	vpas := dynamicinformer.NewFilteredDynamicInformer(
+		dynamicClient, controller.VPAResource(), metav1.NamespaceAll, 0, cache.Indexers{}, nil).Informer()
 	queue := workqueue.NewRateLimitingQueue(workqueue.DefaultControllerRateLimiter())
 	defer queue.ShutDown()
 	reconciler := &controller.Reconciler{
@@ -90,10 +99,12 @@ func run(ctx context.Context) error {
 		Deployments:   deployments.GetStore(),
 		StatefulSets:  statefulSets.GetStore(),
 		ConfigMaps:    configMaps.GetStore(),
+		VPAs:          vpas.GetStore(),
 	}
 
 	registerWorkloadHandlers(deployments, controller.DeploymentKind, queue)
 	registerWorkloadHandlers(statefulSets, controller.StatefulSetKind, queue)
+	registerVPAHandlers(vpas, queue)
 	configMaps.AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc: func(object any) {
 			if isProfileConfigMap(object, *profileNamespace, *profileName) {
@@ -113,7 +124,9 @@ func run(ctx context.Context) error {
 	})
 
 	factory.Start(ctx.Done())
-	if !cache.WaitForCacheSync(ctx.Done(), deployments.HasSynced, statefulSets.HasSynced, configMaps.HasSynced) {
+	go configMaps.Run(ctx.Done())
+	go vpas.Run(ctx.Done())
+	if !cache.WaitForCacheSync(ctx.Done(), deployments.HasSynced, statefulSets.HasSynced, configMaps.HasSynced, vpas.HasSynced) {
 		if ctx.Err() != nil {
 			return nil
 		}
@@ -133,6 +146,13 @@ func run(ctx context.Context) error {
 	return nil
 }
 
+func newProfileConfigMapInformer(kube kubeclient.Interface, namespace, name string) cache.SharedIndexInformer {
+	return coreinformers.NewFilteredConfigMapInformer(kube, namespace, 0, cache.Indexers{},
+		func(options *metav1.ListOptions) {
+			options.FieldSelector = fields.OneTermEqualSelector("metadata.name", name).String()
+		})
+}
+
 func registerWorkloadHandlers(informer cache.SharedIndexInformer, kind string, queue workqueue.RateLimitingInterface) {
 	enqueue := func(object any) {
 		key, err := cache.DeletionHandlingMetaNamespaceKeyFunc(object)
@@ -149,11 +169,79 @@ func registerWorkloadHandlers(informer cache.SharedIndexInformer, kind string, q
 	}
 	informer.AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc: enqueue,
-		UpdateFunc: func(_, current any) {
-			enqueue(current)
+		UpdateFunc: func(previous, current any) {
+			if workloadChanged(previous, current) {
+				enqueue(current)
+			}
 		},
 		DeleteFunc: enqueue,
 	})
+}
+
+func workloadChanged(previous, current any) bool {
+	oldWorkload, oldOK := previous.(metav1.Object)
+	newWorkload, newOK := current.(metav1.Object)
+	return oldOK && newOK && (oldWorkload.GetUID() != newWorkload.GetUID() ||
+		oldWorkload.GetGeneration() != newWorkload.GetGeneration() ||
+		oldWorkload.GetAnnotations()[api.ProfileAnnotation] != newWorkload.GetAnnotations()[api.ProfileAnnotation] ||
+		!apiequality.Semantic.DeepEqual(oldWorkload.GetDeletionTimestamp(), newWorkload.GetDeletionTimestamp()))
+}
+
+func registerVPAHandlers(informer cache.SharedIndexInformer, queue workqueue.RateLimitingInterface) {
+	informer.AddEventHandler(cache.ResourceEventHandlerFuncs{
+		AddFunc: func(object any) { enqueueManagedVPA(object, queue) },
+		UpdateFunc: func(previous, current any) {
+			if vpaChanged(previous, current) {
+				enqueueManagedVPA(previous, queue)
+				enqueueManagedVPA(current, queue)
+			}
+		},
+		DeleteFunc: func(object any) { enqueueManagedVPA(object, queue) },
+	})
+}
+
+func vpaChanged(previous, current any) bool {
+	oldVPA, oldOK := previous.(*unstructured.Unstructured)
+	newVPA, newOK := current.(*unstructured.Unstructured)
+	return oldOK && newOK && (oldVPA.GetUID() != newVPA.GetUID() ||
+		!apiequality.Semantic.DeepEqual(oldVPA.Object["spec"], newVPA.Object["spec"]) ||
+		!apiequality.Semantic.DeepEqual(oldVPA.GetOwnerReferences(), newVPA.GetOwnerReferences()) ||
+		!apiequality.Semantic.DeepEqual(oldVPA.GetLabels(), newVPA.GetLabels()) ||
+		!apiequality.Semantic.DeepEqual(oldVPA.GetDeletionTimestamp(), newVPA.GetDeletionTimestamp()))
+}
+
+func enqueueManagedVPA(object any, queue workqueue.RateLimitingInterface) {
+	if tombstone, ok := object.(cache.DeletedFinalStateUnknown); ok {
+		object = tombstone.Obj
+	}
+	vpa, ok := object.(*unstructured.Unstructured)
+	if !ok {
+		return
+	}
+	kind, name := "", ""
+	for _, owner := range vpa.GetOwnerReferences() {
+		if owner.APIVersion != "apps/v1" || owner.Controller == nil || !*owner.Controller ||
+			(owner.Kind != controller.DeploymentKind && owner.Kind != controller.StatefulSetKind) {
+			continue
+		}
+		kind, name = owner.Kind, owner.Name
+		break
+	}
+	if kind == "" {
+		targetKind, _, _ := unstructured.NestedString(vpa.Object, "spec", "targetRef", "kind")
+		targetName, _, _ := unstructured.NestedString(vpa.Object, "spec", "targetRef", "name")
+		if targetKind == controller.DeploymentKind || targetKind == controller.StatefulSetKind {
+			kind, name = targetKind, targetName
+		}
+	}
+	if kind == "" || name == "" {
+		return
+	}
+	owned := controller.IsManagedVPA(vpa, kind, name)
+	if !owned && controller.VPAName(kind, name) != vpa.GetName() {
+		return
+	}
+	queue.Add(controller.WorkloadKey(kind, vpa.GetNamespace(), name))
 }
 
 func runWorker(ctx context.Context, queue workqueue.RateLimitingInterface, reconciler *controller.Reconciler) {

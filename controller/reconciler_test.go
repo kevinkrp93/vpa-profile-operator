@@ -2,18 +2,22 @@ package controller
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"testing"
 
 	"github.com/kevinkrp93/vpa-profile-operator/api"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	apiequality "k8s.io/apimachinery/pkg/api/equality"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/validation"
 	dynamicfake "k8s.io/client-go/dynamic/fake"
+	clienttesting "k8s.io/client-go/testing"
 	"k8s.io/client-go/tools/cache"
 )
 
@@ -50,15 +54,21 @@ profiles:
 	}
 	assertVPAValues(t, vpa, DeploymentKind, "checkout", "5m0s", 0.15)
 	assertOwnerUID(t, vpa, "deployment-uid")
+	vpa.SetUID(types.UID("managed-vpa-uid"))
+	vpa.SetResourceVersion("1")
+	if _, err := client.Resource(vpaGVR).Namespace("apps").Update(ctx, vpa, metav1.UpdateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := reconciler.VPAs.Add(vpa); err != nil {
+		t.Fatal(err)
+	}
 
 	client.ClearActions()
 	if err := reconciler.Reconcile(ctx, key); err != nil {
 		t.Fatal(err)
 	}
-	for _, action := range client.Actions() {
-		if action.GetVerb() != "get" {
-			t.Fatalf("identical reconciliation issued a write action: %s %s", action.GetVerb(), action.GetResource().Resource)
-		}
+	if len(client.Actions()) != 0 {
+		t.Fatalf("identical reconciliation contacted the API server: %v", client.Actions())
 	}
 
 	configMap = testConfigMap("profiles:\n  aggressive:\n    cpuHistogramDecayHalfLife: 10m\n    podUpdateThreshold: 0.15\n")
@@ -73,6 +83,9 @@ profiles:
 		t.Fatal(err)
 	}
 	assertVPAValues(t, vpa, DeploymentKind, "checkout", "10m0s", -1)
+	if err := reconciler.VPAs.Update(vpa); err != nil {
+		t.Fatal(err)
+	}
 
 	deployment.Annotations = nil
 	if err := deployments.Update(deployment); err != nil {
@@ -136,6 +149,9 @@ func TestReconcileProtectsUIDAndUnmanagedVPAs(t *testing.T) {
 		existing, _ := DesiredVPA("apps", VPAName(DeploymentKind, "checkout"), DeploymentKind, "checkout", types.UID("old-uid"), api.ResolvedProfile{})
 		_, _ = client.Resource(vpaGVR).Namespace("apps").Create(ctx, existing, metav1.CreateOptions{})
 		reconciler := testReconciler(client, deployments, cache.NewStore(cache.MetaNamespaceKeyFunc), configMaps)
+		if err := reconciler.VPAs.Add(existing); err != nil {
+			t.Fatal(err)
+		}
 		if err := reconciler.Reconcile(ctx, WorkloadKey(DeploymentKind, "apps", "checkout")); err == nil {
 			t.Fatal("expected UID ownership conflict")
 		}
@@ -148,6 +164,9 @@ func TestReconcileProtectsUIDAndUnmanagedVPAs(t *testing.T) {
 		}}
 		_, _ = client.Resource(vpaGVR).Namespace("apps").Create(ctx, unmanaged, metav1.CreateOptions{})
 		reconciler := testReconciler(client, deployments, cache.NewStore(cache.MetaNamespaceKeyFunc), configMaps)
+		if err := reconciler.VPAs.Add(unmanaged); err != nil {
+			t.Fatal(err)
+		}
 		if err := reconciler.Reconcile(ctx, WorkloadKey(DeploymentKind, "apps", "checkout")); err == nil {
 			t.Fatal("expected unmanaged VPA collision")
 		}
@@ -244,6 +263,15 @@ profiles:
 		t.Fatal(err)
 	}
 
+	created, err := client.Resource(vpaGVR).Namespace("apps").Get(ctx, VPAName(DeploymentKind, "checkout"), metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	created.SetUID("vpa-uid")
+	created.SetResourceVersion("1")
+	if err := reconciler.VPAs.Add(created); err != nil {
+		t.Fatal(err)
+	}
 	deployment.Annotations[api.ProfileAnnotation] = "aggressive"
 	_ = deployments.Update(deployment)
 	if err := reconciler.Reconcile(ctx, key); err != nil {
@@ -274,11 +302,279 @@ func TestAnnotationRemovalDoesNotDeleteVPAOwnedByDifferentUID(t *testing.T) {
 	}
 	_, _ = client.Resource(vpaGVR).Namespace("apps").Create(ctx, existing, metav1.CreateOptions{})
 	reconciler := testReconciler(client, deployments, cache.NewStore(cache.MetaNamespaceKeyFunc), cache.NewStore(cache.MetaNamespaceKeyFunc))
+	if err := reconciler.VPAs.Add(existing); err != nil {
+		t.Fatal(err)
+	}
 	if err := reconciler.Reconcile(ctx, WorkloadKey(DeploymentKind, "apps", "checkout")); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := client.Resource(vpaGVR).Namespace("apps").Get(ctx, VPAName(DeploymentKind, "checkout"), metav1.GetOptions{}); err != nil {
 		t.Fatalf("VPA owned by a different UID was deleted: %v", err)
+	}
+}
+
+func TestDeleteUsesUIDAndResourceVersionPreconditions(t *testing.T) {
+	ctx := context.Background()
+	client := dynamicfake.NewSimpleDynamicClient(runtime.NewScheme())
+	existing, err := DesiredVPA("apps", VPAName(DeploymentKind, "checkout"), DeploymentKind, "checkout",
+		types.UID("workload-uid"), api.ResolvedProfile{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	existing.SetUID("vpa-uid-old")
+	existing.SetResourceVersion("17")
+	if _, err := client.Resource(vpaGVR).Namespace("apps").Create(ctx, existing, metav1.CreateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	client.PrependReactor("delete", "verticalpodautoscalers", func(action clienttesting.Action) (bool, runtime.Object, error) {
+		options := action.(clienttesting.DeleteAction).GetDeleteOptions()
+		if options.Preconditions == nil || options.Preconditions.UID == nil ||
+			*options.Preconditions.UID != types.UID("vpa-uid-old") ||
+			options.Preconditions.ResourceVersion == nil || *options.Preconditions.ResourceVersion != "17" {
+			t.Fatalf("delete lacked the fetched VPA UID/resourceVersion preconditions: %+v", options.Preconditions)
+		}
+		replacement := existing.DeepCopy()
+		replacement.SetUID("vpa-uid-replacement")
+		replacement.SetResourceVersion("18")
+		if err := client.Tracker().Delete(vpaGVR, "apps", existing.GetName()); err != nil {
+			t.Fatal(err)
+		}
+		if err := client.Tracker().Create(vpaGVR, replacement, "apps"); err != nil {
+			t.Fatal(err)
+		}
+		return true, nil, apierrors.NewConflict(vpaGVR.GroupResource(), existing.GetName(), nil)
+	})
+	reconciler := &Reconciler{DynamicClient: client, VPAs: cache.NewStore(cache.MetaNamespaceKeyFunc)}
+	if err := reconciler.VPAs.Add(existing); err != nil {
+		t.Fatal(err)
+	}
+	client.ClearActions()
+	if err := reconciler.deleteOwnedVPA(ctx, "apps", existing.GetName(), DeploymentKind, "checkout", "workload-uid"); !apierrors.IsConflict(err) {
+		t.Fatal("expected delete conflict after a concurrent replacement")
+	}
+	if actions := client.Actions(); len(actions) != 1 || actions[0].GetVerb() != "delete" {
+		t.Fatalf("delete must use the cache without API reads: %v", actions)
+	}
+	replacement, err := client.Resource(vpaGVR).Namespace("apps").Get(ctx, existing.GetName(), metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("concurrent VPA replacement was removed: %v", err)
+	}
+	if replacement.GetUID() != types.UID("vpa-uid-replacement") {
+		t.Fatalf("unexpected remaining VPA UID: %q", replacement.GetUID())
+	}
+}
+
+func TestReconcileReadsOnlyCacheAndDoesNotMutateIt(t *testing.T) {
+	ctx := context.Background()
+	client := dynamicfake.NewSimpleDynamicClient(runtime.NewScheme())
+	deployments := cache.NewStore(cache.MetaNamespaceKeyFunc)
+	configMaps := cache.NewStore(cache.MetaNamespaceKeyFunc)
+	if err := deployments.Add(testDeployment("checkout", "workload-uid", "baseline")); err != nil {
+		t.Fatal(err)
+	}
+	if err := configMaps.Add(testConfigMap("profiles:\n  baseline:\n    cpuHistogramDecayHalfLife: 1h\n    podUpdateThreshold: 0.1\n")); err != nil {
+		t.Fatal(err)
+	}
+	reconciler := testReconciler(client, deployments, cache.NewStore(cache.MetaNamespaceKeyFunc), configMaps)
+	key := WorkloadKey(DeploymentKind, "apps", "checkout")
+	if err := reconciler.Reconcile(ctx, key); err != nil {
+		t.Fatal(err)
+	}
+	if actions := client.Actions(); len(actions) != 1 || actions[0].GetVerb() != "create" {
+		t.Fatalf("cache miss should issue only a create, got %v", actions)
+	}
+	name := VPAName(DeploymentKind, "checkout")
+	object, err := client.Tracker().Get(vpaGVR, "apps", name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cached := object.(*unstructured.Unstructured)
+	cached.SetUID("vpa-uid")
+	cached.SetResourceVersion("17")
+	cached.Object["status"] = map[string]any{"recommendation": map[string]any{"containerRecommendations": []any{}}}
+	cached.SetAnnotations(map[string]string{"unrelated": "keep"})
+	if err := reconciler.VPAs.Add(cached); err != nil {
+		t.Fatal(err)
+	}
+	before := cached.DeepCopy()
+	client.ClearActions()
+	for range 1000 {
+		if err := reconciler.Reconcile(ctx, key); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if len(client.Actions()) != 0 {
+		t.Fatalf("no-op reconciliation must not contact the API server: %v", client.Actions())
+	}
+	if err := configMaps.Update(testConfigMap("profiles:\n  baseline:\n    cpuHistogramDecayHalfLife: 2h\n    podUpdateThreshold: 0.1\n")); err != nil {
+		t.Fatal(err)
+	}
+	if err := reconciler.Reconcile(ctx, key); err != nil {
+		t.Fatal(err)
+	}
+	actions := client.Actions()
+	if len(actions) != 1 || actions[0].GetVerb() != "update" {
+		t.Fatalf("profile change should issue only an update, got %v", actions)
+	}
+	updated := actions[0].(clienttesting.UpdateAction).GetObject().(*unstructured.Unstructured)
+	if updated.GetUID() != cached.GetUID() || updated.GetResourceVersion() != "17" ||
+		updated.GetAnnotations()["unrelated"] != "keep" ||
+		!apiequality.Semantic.DeepEqual(updated.Object["status"], before.Object["status"]) {
+		t.Fatalf("update did not preserve cached identity, version, or unrelated fields: %v", updated)
+	}
+	if !apiequality.Semantic.DeepEqual(cached, before) {
+		t.Fatal("reconciliation mutated the shared informer object")
+	}
+	assertVPAValues(t, updated, DeploymentKind, "checkout", "2h0m0s", 0.1)
+}
+
+func TestCacheMissCreateCollisionRechecksOwnership(t *testing.T) {
+	client := dynamicfake.NewSimpleDynamicClient(runtime.NewScheme())
+	deployments := cache.NewStore(cache.MetaNamespaceKeyFunc)
+	configMaps := cache.NewStore(cache.MetaNamespaceKeyFunc)
+	if err := deployments.Add(testDeployment("checkout", "workload-uid", "baseline")); err != nil {
+		t.Fatal(err)
+	}
+	if err := configMaps.Add(testConfigMap("profiles:\n  baseline:\n    cpuHistogramDecayHalfLife: 1h\n    podUpdateThreshold: 0.1\n")); err != nil {
+		t.Fatal(err)
+	}
+	existing := &unstructured.Unstructured{Object: map[string]any{
+		"apiVersion": "autoscaling.k8s.io/v1", "kind": "VerticalPodAutoscaler",
+		"metadata": map[string]any{"namespace": "apps", "name": VPAName(DeploymentKind, "checkout"), "uid": "unmanaged-uid"},
+	}}
+	if err := client.Tracker().Create(vpaGVR, existing, "apps"); err != nil {
+		t.Fatal(err)
+	}
+	reconciler := testReconciler(client, deployments, cache.NewStore(cache.MetaNamespaceKeyFunc), configMaps)
+	key := WorkloadKey(DeploymentKind, "apps", "checkout")
+	if err := reconciler.Reconcile(context.Background(), key); !apierrors.IsAlreadyExists(err) {
+		t.Fatalf("cache miss should surface AlreadyExists for a queue retry, got %v", err)
+	}
+	if actions := client.Actions(); len(actions) != 1 || actions[0].GetVerb() != "create" {
+		t.Fatalf("collision must not fall back to API reads or overwrite: %v", actions)
+	}
+	if err := reconciler.VPAs.Add(existing); err != nil {
+		t.Fatal(err)
+	}
+	client.ClearActions()
+	if err := reconciler.Reconcile(context.Background(), key); err == nil || !strings.Contains(err.Error(), "not owned") {
+		t.Fatalf("retry must recheck ownership against the refreshed cache, got %v", err)
+	}
+	if len(client.Actions()) != 0 {
+		t.Fatalf("unmanaged object must not be changed: %v", client.Actions())
+	}
+}
+
+func TestUpdateConflictUsesRefreshedCacheAndOwnership(t *testing.T) {
+	for _, owned := range []bool{false, true} {
+		t.Run(fmt.Sprintf("replacement-owned-%t", owned), func(t *testing.T) {
+			ctx := context.Background()
+			client := dynamicfake.NewSimpleDynamicClient(runtime.NewScheme())
+			deployments := cache.NewStore(cache.MetaNamespaceKeyFunc)
+			configMaps := cache.NewStore(cache.MetaNamespaceKeyFunc)
+			if err := deployments.Add(testDeployment("checkout", "workload-uid", "baseline")); err != nil {
+				t.Fatal(err)
+			}
+			if err := configMaps.Add(testConfigMap("profiles:\n  baseline:\n    cpuHistogramDecayHalfLife: 1h\n    podUpdateThreshold: 0.1\n")); err != nil {
+				t.Fatal(err)
+			}
+			cached, err := DesiredVPA("apps", VPAName(DeploymentKind, "checkout"), DeploymentKind, "checkout", "workload-uid", api.ResolvedProfile{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			cached.SetUID("old-vpa-uid")
+			cached.SetResourceVersion("17")
+			replacement := cached.DeepCopy()
+			replacement.SetUID("new-vpa-uid")
+			replacement.SetResourceVersion("18")
+			if !owned {
+				replacement.SetLabels(nil)
+				replacement.SetOwnerReferences(nil)
+			}
+			if err := client.Tracker().Create(vpaGVR, replacement, "apps"); err != nil {
+				t.Fatal(err)
+			}
+			reconciler := testReconciler(client, deployments, cache.NewStore(cache.MetaNamespaceKeyFunc), configMaps)
+			if err := reconciler.VPAs.Add(cached); err != nil {
+				t.Fatal(err)
+			}
+			client.PrependReactor("update", "verticalpodautoscalers", func(action clienttesting.Action) (bool, runtime.Object, error) {
+				object := action.(clienttesting.UpdateAction).GetObject().(*unstructured.Unstructured)
+				if object.GetResourceVersion() == "17" {
+					if object.GetUID() != cached.GetUID() {
+						t.Error("update did not preserve cached UID")
+					}
+					return true, nil, apierrors.NewConflict(vpaGVR.GroupResource(), cached.GetName(), nil)
+				}
+				return false, nil, nil
+			})
+			key := WorkloadKey(DeploymentKind, "apps", "checkout")
+			if err := reconciler.Reconcile(ctx, key); !apierrors.IsConflict(err) {
+				t.Fatalf("stale update should return Conflict for a queue retry, got %v", err)
+			}
+			if actions := client.Actions(); len(actions) != 1 || actions[0].GetVerb() != "update" {
+				t.Fatalf("conflict should not trigger a GET or unconditional write: %v", actions)
+			}
+			if !apiequality.Semantic.DeepEqual(cached.Object["spec"], replacement.Object["spec"]) {
+				t.Fatal("conflicting update mutated the cache")
+			}
+			if err := reconciler.VPAs.Update(replacement); err != nil {
+				t.Fatal(err)
+			}
+			client.ClearActions()
+			err = reconciler.Reconcile(ctx, key)
+			if !owned {
+				if err == nil || len(client.Actions()) != 0 {
+					t.Fatalf("retry must protect the unowned replacement, err=%v actions=%v", err, client.Actions())
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			actions := client.Actions()
+			if len(actions) != 1 || actions[0].GetVerb() != "update" {
+				t.Fatalf("expected one update from the refreshed cache, got %v", actions)
+			}
+			updated := actions[0].(clienttesting.UpdateAction).GetObject().(*unstructured.Unstructured)
+			if updated.GetResourceVersion() != "18" || updated.GetUID() != replacement.GetUID() {
+				t.Fatalf("retry used stale identity/version: %v", updated)
+			}
+		})
+	}
+}
+
+func TestWritesRejectMissingCachedIdentityOrVersion(t *testing.T) {
+	for _, missing := range []string{"uid", "resourceVersion"} {
+		for _, operation := range []string{"update", "delete"} {
+			t.Run(operation+"-missing-"+missing, func(t *testing.T) {
+				client := dynamicfake.NewSimpleDynamicClient(runtime.NewScheme())
+				reconciler := &Reconciler{DynamicClient: client, VPAs: cache.NewStore(cache.MetaNamespaceKeyFunc)}
+				existing, err := DesiredVPA("apps", VPAName(DeploymentKind, "checkout"), DeploymentKind, "checkout", "workload-uid", api.ResolvedProfile{})
+				if err != nil {
+					t.Fatal(err)
+				}
+				existing.SetUID("vpa-uid")
+				existing.SetResourceVersion("17")
+				unstructured.RemoveNestedField(existing.Object, "metadata", missing)
+				if err := reconciler.VPAs.Add(existing); err != nil {
+					t.Fatal(err)
+				}
+				if operation == "update" {
+					desired := existing.DeepCopy()
+					desired.Object["spec"] = map[string]any{"changed": true}
+					err = reconciler.applyVPA(context.Background(), "apps", existing.GetName(), desired, DeploymentKind, "checkout", "workload-uid")
+				} else {
+					err = reconciler.deleteOwnedVPA(context.Background(), "apps", existing.GetName(), DeploymentKind, "checkout", "workload-uid")
+				}
+				if err == nil || !strings.Contains(err.Error(), "without UID and resourceVersion") {
+					t.Fatalf("expected explicit missing metadata error, got %v", err)
+				}
+				if len(client.Actions()) != 0 {
+					t.Fatalf("unsafe write reached the API server: %v", client.Actions())
+				}
+			})
+		}
 	}
 }
 
@@ -311,6 +607,7 @@ func testReconciler(client *dynamicfake.FakeDynamicClient, deployments, stateful
 		Deployments:   deployments,
 		StatefulSets:  statefulSets,
 		ConfigMaps:    configMaps,
+		VPAs:          cache.NewStore(cache.MetaNamespaceKeyFunc),
 	}
 }
 
