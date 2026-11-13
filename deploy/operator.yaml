@@ -62,7 +62,7 @@ spec:
           type: RuntimeDefault
       containers:
         - name: operator
-          image: ghcr.io/kevinkrp93/vpa-profile-operator:latest
+          image: ghcr.io/kevinkrp93/vpa-profile-operator:vpa-profile-poc
           imagePullPolicy: IfNotPresent
           args:
             - --profile-configmap-namespace=vpa-system

@@ -24,7 +24,8 @@ The `Publish profile operator image` GitHub Actions workflow publishes
 `ghcr.io/kevinkrp93/vpa-profile-operator:vpa-profile-poc` on pushes to `main`.
 It also publishes a `sha-<commit>` tag for each build. Package visibility must
 be set to public in GitHub Packages before unauthenticated pulls will work.
-Set the operator image in `deploy/operator.yaml` to the desired published tag.
+The deployment uses the `vpa-profile-poc` tag by default; change it to a
+specific tag if desired.
 
 Alternatively, build and publish your own operator image:
 
@@ -35,8 +36,8 @@ make image IMAGE=ghcr.io/OWNER/vpa-profile-operator:TAG
 docker push ghcr.io/OWNER/vpa-profile-operator:TAG
 ```
 
-Set the published image in `deploy/operator.yaml`, then install the operator
-and example profiles:
+For a custom build, set the published image in `deploy/operator.yaml`. Install
+the operator and example profiles:
 
 ```sh
 kubectl apply -f deploy/operator.yaml
