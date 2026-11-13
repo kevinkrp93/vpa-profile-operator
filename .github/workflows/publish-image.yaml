@@ -1,8 +1,6 @@
 name: Publish profile operator image
 
 on:
-  push:
-    branches: [main]
   workflow_dispatch:
 
 permissions:
@@ -17,6 +15,12 @@ jobs:
   publish:
     runs-on: ubuntu-latest
     steps:
+      - name: Require the main branch
+        run: |
+          if [ "$GITHUB_REF" != "refs/heads/main" ]; then
+            echo "::error::Select the main branch when running this workflow."
+            exit 1
+          fi
       - name: Check out source
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Log in to GHCR
