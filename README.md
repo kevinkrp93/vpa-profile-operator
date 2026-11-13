@@ -20,7 +20,13 @@ subsequently evict pods according to the VPA policy.
 
 ## Install
 
-Build and publish only this operator image:
+The `Publish profile operator image` GitHub Actions workflow publishes
+`ghcr.io/kevinkrp93/vpa-profile-operator:vpa-profile-poc` on pushes to `main`.
+It also publishes a `sha-<commit>` tag for each build. Package visibility must
+be set to public in GitHub Packages before unauthenticated pulls will work.
+Set the operator image in `deploy/operator.yaml` to the desired published tag.
+
+Alternatively, build and publish your own operator image:
 
 ```sh
 make test
