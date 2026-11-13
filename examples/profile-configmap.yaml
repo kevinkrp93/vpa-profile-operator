@@ -9,6 +9,8 @@ data:
       conservative:
         cpuHistogramDecayHalfLife: 24h
         podUpdateThreshold: 0.2
+        inRecommendationBoundsEvictionLifetimeThreshold: 0s
       aggressive:
         cpuHistogramDecayHalfLife: 4h
         podUpdateThreshold: 0.05
+        inRecommendationBoundsEvictionLifetimeThreshold: 0s

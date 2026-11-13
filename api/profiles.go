@@ -30,8 +30,9 @@ const (
 )
 
 type Profile struct {
-	CPUHistogramDecayHalfLife string   `json:"cpuHistogramDecayHalfLife"`
-	PodUpdateThreshold        *float64 `json:"podUpdateThreshold"`
+	CPUHistogramDecayHalfLife                       string   `json:"cpuHistogramDecayHalfLife"`
+	PodUpdateThreshold                              *float64 `json:"podUpdateThreshold"`
+	InRecommendationBoundsEvictionLifetimeThreshold *string  `json:"inRecommendationBoundsEvictionLifetimeThreshold,omitempty"`
 }
 
 type ProfileSet struct {
@@ -39,8 +40,9 @@ type ProfileSet struct {
 }
 
 type ResolvedProfile struct {
-	CPUHistogramDecayHalfLife time.Duration
-	PodUpdateThreshold        *float64
+	CPUHistogramDecayHalfLife                       time.Duration
+	PodUpdateThreshold                              *float64
+	InRecommendationBoundsEvictionLifetimeThreshold *time.Duration
 }
 
 func ParseProfiles(content string) (ProfileSet, error) {
@@ -68,6 +70,12 @@ func ParseProfiles(content string) (ProfileSet, error) {
 		if profile.PodUpdateThreshold != nil && *profile.PodUpdateThreshold < 0 {
 			return ProfileSet{}, fmt.Errorf("profile %q podUpdateThreshold must be non-negative", name)
 		}
+		if profile.InRecommendationBoundsEvictionLifetimeThreshold != nil {
+			lifetime, err := time.ParseDuration(*profile.InRecommendationBoundsEvictionLifetimeThreshold)
+			if err != nil || lifetime < 0 {
+				return ProfileSet{}, fmt.Errorf("profile %q has invalid inRecommendationBoundsEvictionLifetimeThreshold %q: must be a non-negative duration", name, *profile.InRecommendationBoundsEvictionLifetimeThreshold)
+			}
+		}
 	}
 	return result, nil
 }
@@ -83,6 +91,13 @@ func (profiles ProfileSet) Resolve(name string) (ResolvedProfile, error) {
 		return ResolvedProfile{}, fmt.Errorf("profile %q has invalid cpuHistogramDecayHalfLife: %w", name, err)
 	}
 	result.CPUHistogramDecayHalfLife = halfLife
+	if profile.InRecommendationBoundsEvictionLifetimeThreshold != nil {
+		lifetime, err := time.ParseDuration(*profile.InRecommendationBoundsEvictionLifetimeThreshold)
+		if err != nil || lifetime < 0 {
+			return ResolvedProfile{}, fmt.Errorf("profile %q has invalid inRecommendationBoundsEvictionLifetimeThreshold %q: must be a non-negative duration", name, *profile.InRecommendationBoundsEvictionLifetimeThreshold)
+		}
+		result.InRecommendationBoundsEvictionLifetimeThreshold = &lifetime
+	}
 	if profile.PodUpdateThreshold != nil {
 		threshold := *profile.PodUpdateThreshold
 		result.PodUpdateThreshold = &threshold

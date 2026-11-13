@@ -13,6 +13,8 @@ subsequently evict pods according to the VPA policy.
 - A VPA build whose `autoscaling.k8s.io/v1` CRD includes
   `resourcePolicy.containerPolicies[].cpuHistogramDecayHalfLife` and
   `updatePolicy.podUpdateThreshold`.
+- For the optional profile lifetime override, the VPA CRD and updater must
+  also support `updatePolicy.inRecommendationBoundsEvictionLifetimeThreshold`.
 - `PerVPAConfig` enabled on the VPA components that consume or validate these
   per-VPA fields (including recommender, updater, and admission controller when
   deployed). Add `--feature-gates=PerVPAConfig=true` to those component
@@ -62,13 +64,26 @@ profiles:
   conservative:
     cpuHistogramDecayHalfLife: 24h
     podUpdateThreshold: 0.2
+    inRecommendationBoundsEvictionLifetimeThreshold: 0s
   aggressive:
     cpuHistogramDecayHalfLife: 4h
     podUpdateThreshold: 0.05
+    inRecommendationBoundsEvictionLifetimeThreshold: 0s
 ```
 
 Each profile must specify both values. The half-life must be a positive Go
-duration. The threshold must be a non-negative number. Apply a profile on a
+duration. The threshold must be a non-negative number.
+`inRecommendationBoundsEvictionLifetimeThreshold` is an optional non-negative
+Go duration. When set, the operator writes it to the VPA update policy,
+overriding the updater's global
+`--in-recommendation-bounds-eviction-lifetime-threshold` for that VPA.
+When omitted, the global flag still applies (its default remains 12 hours).
+The example profiles explicitly use `0s` to remove only the minimum pod-age
+wait for in-range updates; resource-difference, disruption and other safety
+checks still apply. Changing or removing this value reconciles existing
+managed VPAs. This override also requires `PerVPAConfig=true`.
+
+Apply a profile on a
 Deployment or StatefulSet's **object metadata** (not its pod template):
 
 ```yaml

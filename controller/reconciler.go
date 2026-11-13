@@ -221,6 +221,9 @@ func DesiredVPA(namespace, vpaName, targetKind, targetName string, uid types.UID
 	if profile.PodUpdateThreshold != nil {
 		updatePolicy["podUpdateThreshold"] = *profile.PodUpdateThreshold
 	}
+	if profile.InRecommendationBoundsEvictionLifetimeThreshold != nil {
+		updatePolicy["inRecommendationBoundsEvictionLifetimeThreshold"] = profile.InRecommendationBoundsEvictionLifetimeThreshold.String()
+	}
 	vpa := &unstructured.Unstructured{Object: map[string]any{
 		"apiVersion": "autoscaling.k8s.io/v1",
 		"kind":       "VerticalPodAutoscaler",

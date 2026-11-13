@@ -30,6 +30,7 @@ profiles:
   aggressive:
     cpuHistogramDecayHalfLife: 5m
     podUpdateThreshold: 0.15
+    inRecommendationBoundsEvictionLifetimeThreshold: 0s
 `)
 	deployments := cache.NewStore(cache.MetaNamespaceKeyFunc)
 	statefulSets := cache.NewStore(cache.MetaNamespaceKeyFunc)
@@ -53,6 +54,7 @@ profiles:
 		t.Fatal(err)
 	}
 	assertVPAValues(t, vpa, DeploymentKind, "checkout", "5m0s", 0.15)
+	assertVPALifetime(t, vpa, "0s")
 	assertOwnerUID(t, vpa, "deployment-uid")
 	vpa.SetUID(types.UID("managed-vpa-uid"))
 	vpa.SetResourceVersion("1")
@@ -71,7 +73,7 @@ profiles:
 		t.Fatalf("identical reconciliation contacted the API server: %v", client.Actions())
 	}
 
-	configMap = testConfigMap("profiles:\n  aggressive:\n    cpuHistogramDecayHalfLife: 10m\n    podUpdateThreshold: 0.15\n")
+	configMap = testConfigMap("profiles:\n  aggressive:\n    cpuHistogramDecayHalfLife: 10m\n    podUpdateThreshold: 0.15\n    inRecommendationBoundsEvictionLifetimeThreshold: 10m\n")
 	if err := configMaps.Update(configMap); err != nil {
 		t.Fatal(err)
 	}
@@ -83,6 +85,22 @@ profiles:
 		t.Fatal(err)
 	}
 	assertVPAValues(t, vpa, DeploymentKind, "checkout", "10m0s", -1)
+	assertVPALifetime(t, vpa, "10m0s")
+	if err := reconciler.VPAs.Update(vpa); err != nil {
+		t.Fatal(err)
+	}
+	configMap = testConfigMap("profiles:\n  aggressive:\n    cpuHistogramDecayHalfLife: 10m\n    podUpdateThreshold: 0.15\n")
+	if err := configMaps.Update(configMap); err != nil {
+		t.Fatal(err)
+	}
+	if err := reconciler.Reconcile(ctx, key); err != nil {
+		t.Fatal(err)
+	}
+	vpa, err = client.Resource(vpaGVR).Namespace("apps").Get(ctx, vpaName, metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertVPALifetime(t, vpa, "")
 	if err := reconciler.VPAs.Update(vpa); err != nil {
 		t.Fatal(err)
 	}
@@ -625,6 +643,44 @@ func testConfigMap(profiles string) *corev1.ConfigMap {
 	return &corev1.ConfigMap{
 		ObjectMeta: metav1.ObjectMeta{Namespace: "vpa-system", Name: "vpa-profiles"},
 		Data:       map[string]string{"profiles.yaml": profiles},
+	}
+}
+
+func TestDesiredVPALifetimeOverride(t *testing.T) {
+	for _, value := range []string{"", "0s", "10m"} {
+		t.Run(value, func(t *testing.T) {
+			document := "profiles:\n  test:\n    cpuHistogramDecayHalfLife: 5m\n    podUpdateThreshold: 0.1\n"
+			if value != "" {
+				document += "    inRecommendationBoundsEvictionLifetimeThreshold: " + value + "\n"
+			}
+			profiles, err := api.ParseProfiles(document)
+			if err != nil {
+				t.Fatal(err)
+			}
+			resolved, err := profiles.Resolve("test")
+			if err != nil {
+				t.Fatal(err)
+			}
+			vpa, err := DesiredVPA("apps", "test", DeploymentKind, "test", types.UID("uid"), resolved)
+			if err != nil {
+				t.Fatal(err)
+			}
+			got, found, err := unstructured.NestedString(vpa.Object, "spec", "updatePolicy", "inRecommendationBoundsEvictionLifetimeThreshold")
+			if err != nil || found != (value != "") {
+				t.Fatalf("unexpected lifetime presence: %q, %t, %v", got, found, err)
+			}
+			if found && got != resolved.InRecommendationBoundsEvictionLifetimeThreshold.String() {
+				t.Fatalf("unexpected lifetime value: %q", got)
+			}
+		})
+	}
+}
+
+func assertVPALifetime(t *testing.T, vpa *unstructured.Unstructured, want string) {
+	t.Helper()
+	got, found, err := unstructured.NestedString(vpa.Object, "spec", "updatePolicy", "inRecommendationBoundsEvictionLifetimeThreshold")
+	if err != nil || found != (want != "") || got != want {
+		t.Fatalf("unexpected lifetime: %q, present=%t, err=%v; want %q", got, found, err, want)
 	}
 }
 

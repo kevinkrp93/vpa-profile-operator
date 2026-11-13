@@ -26,6 +26,46 @@ profiles:
 	if resolved.PodUpdateThreshold == nil || *resolved.PodUpdateThreshold != 0.1 {
 		t.Fatalf("unexpected update threshold: %v", resolved.PodUpdateThreshold)
 	}
+	if resolved.InRecommendationBoundsEvictionLifetimeThreshold != nil {
+		t.Fatal("omitted lifetime must remain absent to use the updater's global flag")
+	}
+}
+
+func TestProfileLifetimeOverrides(t *testing.T) {
+	for _, tc := range []struct {
+		value string
+		valid bool
+		want  time.Duration
+	}{
+		{value: "0s", valid: true},
+		{value: "10m", valid: true, want: 10 * time.Minute},
+		{value: "-1s"},
+		{value: "invalid"},
+		{value: ""},
+	} {
+		t.Run(tc.value, func(t *testing.T) {
+			profiles, err := ParseProfiles("profiles:\n  test:\n    cpuHistogramDecayHalfLife: 5m\n    podUpdateThreshold: 0.1\n    inRecommendationBoundsEvictionLifetimeThreshold: \"" + tc.value + "\"\n")
+			if !tc.valid {
+				if err == nil {
+					t.Fatal("expected invalid duration error")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			resolved, err := profiles.Resolve("test")
+			if err != nil || resolved.InRecommendationBoundsEvictionLifetimeThreshold == nil ||
+				*resolved.InRecommendationBoundsEvictionLifetimeThreshold != tc.want {
+				t.Fatalf("unexpected lifetime: %+v, %v", resolved, err)
+			}
+			*resolved.InRecommendationBoundsEvictionLifetimeThreshold = time.Hour
+			again, err := profiles.Resolve("test")
+			if err != nil || *again.InRecommendationBoundsEvictionLifetimeThreshold != tc.want {
+				t.Fatalf("resolved lifetime changed the profile: %+v, %v", again, err)
+			}
+		})
+	}
 }
 
 func TestParseProfilesRejectsInvalidValues(t *testing.T) {
